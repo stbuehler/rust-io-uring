@@ -1,0 +1,9 @@
+[package]
+name = "io-uring-sys"
+version = "0.1.0"
+authors = ["Stefan Bühler <stbuehler@web.de>"]
+edition = "2018"
+
+[dependencies]
+bitflags = "1.0.4"
+libc = "0.2.51"
