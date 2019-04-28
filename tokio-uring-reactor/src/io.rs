@@ -1,4 +1,3 @@
-use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 
@@ -22,7 +21,7 @@ pub trait SocketRead: AsRawFd + Sized {
 }
 
 pub trait SocketWrite: AsRawFd + Sized {
-	fn write<T: AsRef<[u8]>>(self, handle: &Handle, buf: T) -> io::Result<AsyncWrite<T, Self>> {
+	fn write<T: AsRef<[u8]>>(self, handle: &Handle, buf: T) -> AsyncWrite<T, Self> {
 		handle.async_write(self, 0, buf)
 	}
 }

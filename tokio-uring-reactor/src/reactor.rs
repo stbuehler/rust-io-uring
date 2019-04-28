@@ -1,3 +1,7 @@
+mod async_poll;
+mod async_read;
+mod async_write;
+
 use std::{
 	cell::UnsafeCell,
 	convert::Infallible,
@@ -12,11 +16,14 @@ use std::{
 use crate::{
 	registration::{
 		RawRegistration,
-		Registration,
 		UringResult,
 	},
 	unpark,
 };
+
+pub use self::async_poll::AsyncPoll;
+pub use self::async_read::AsyncRead;
+pub use self::async_write::AsyncWrite;
 
 fn iovec_from(data: &[u8]) -> libc::iovec {
 	libc::iovec {
@@ -394,125 +401,6 @@ impl fmt::Debug for Reactor {
 	}
 }
 
-struct ReadContext<T: 'static, F: 'static> {
-	iovec: [libc::iovec; 1],
-	buf: T,
-	file: F,
-}
-
-enum AsyncReadState<T: 'static, F: 'static> {
-	Pending(Registration<ReadContext<T, F>>),
-	InitFailed(io::Error, T, F),
-	Closed,
-}
-
-pub struct AsyncRead<T: 'static, F: 'static>(AsyncReadState<T, F>);
-
-impl<T: 'static, F: 'static> fmt::Debug for AsyncRead<T, F> {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "AsyncRead(..)")
-	}
-}
-
-impl<T: 'static, F: 'static> futures::Future for AsyncRead<T, F> {
-	type Item = (usize, T, F);
-	type Error = (io::Error, T, F);
-
-	fn poll(&mut self) -> futures::Poll<Self::Item, Self::Error> {
-		match self.0 {
-			AsyncReadState::Pending(ref mut p) => {
-				match p.poll() {
-					futures::Async::NotReady => Ok(futures::Async::NotReady),
-					futures::Async::Ready((r, d)) => {
-						let result = if r.result < 0 {
-							Err((io::Error::from_raw_os_error(r.result), d.buf, d.file))
-						} else {
-							Ok(futures::Async::Ready((r.result as usize, d.buf, d.file)))
-						};
-						std::mem::replace(&mut self.0, AsyncReadState::Closed);
-						result
-					}
-				}
-			},
-			_ => {
-				match std::mem::replace(&mut self.0, AsyncReadState::Closed) {
-					AsyncReadState::Pending(_) => unreachable!(),
-					AsyncReadState::InitFailed(e, buf, file) => Err((e, buf, file)),
-					AsyncReadState::Closed => panic!("already finished"),
-				}
-			}
-			
-		}
-	}
-}
-
-struct WriteContext<T: 'static, F: 'static> {
-	iovec: [libc::iovec; 1],
-	buf: T,
-	file: F,
-}
-
-pub struct AsyncWrite<T: 'static, F: 'static>(Registration<WriteContext<T, F>>);
-
-impl<T: 'static, F: 'static> fmt::Debug for AsyncWrite<T, F> {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "AsyncWrite({:?})", self.0)
-	}
-}
-
-impl<T: 'static, F: 'static> futures::Future for AsyncWrite<T, F> {
-	type Item = (usize, T, F);
-	type Error = (io::Error, T, F);
-
-	fn poll(&mut self) -> futures::Poll<Self::Item, Self::Error> {
-		match self.0.poll() {
-			futures::Async::NotReady => Ok(futures::Async::NotReady),
-			futures::Async::Ready((r, d)) => {
-				if r.result < 0 {
-					return Err((io::Error::from_raw_os_error(r.result), d.buf, d.file));
-				}
-				Ok(futures::Async::Ready((r.result as usize, d.buf, d.file)))
-			}
-		}
-	}
-}
-
-// TODO: Dropping AsyncPoll should trigger a POLL_DEL
-#[derive(Debug)]
-pub struct AsyncPoll {
-	handle: Handle,
-	fd: RawFd,
-	active: bool,
-	flags: io_uring::PollFlags,
-	registration: Registration<()>,
-}
-
-impl futures::Stream for AsyncPoll {
-	type Item = io_uring::PollFlags;
-	type Error = io::Error;
-
-	fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
-		if !self.active {
-			// println!("Register fd {} for events {:?}", self.fd, self.flags);
-			let mut im = self.handle.inner_mut()?;
-			im.pinned().queue_async_poll(self.fd, self.flags, self.registration.to_raw())?;
-			self.active = true;
-			self.registration.track();
-			return Ok(futures::Async::NotReady);
-		}
-		match self.registration.poll_stream_and_reset() {
-			futures::Async::NotReady => Ok(futures::Async::NotReady),
-			futures::Async::Ready(r) => {
-				self.active = false;
-				if r.result < 0 {
-					return Err(io::Error::from_raw_os_error(r.result));
-				}
-				let flags = io_uring::PollFlags::from_bits_truncate(r.result as u16);
-				Ok(futures::Async::Ready(Some(flags)))
-			}
-		}
-	}
-}
 
 #[derive(Clone)]
 pub struct Handle(Weak<UnsafeCell<Inner>>);
@@ -526,67 +414,24 @@ impl Handle {
 		Ok(InnerMut { inner })
 	}
 
-	pub fn async_read<T: AsMut<[u8]> + 'static, F: AsRawFd + 'static>(&self, file: F, offset: u64, buf: T) -> AsyncRead<T, F> {
-		let fd = file.as_raw_fd();
-		let mut im = match self.inner_mut() {
-			Err(e) => return AsyncRead(AsyncReadState::InitFailed(e, buf, file)),
-			Ok(im) => im,
-		};
-
-		let rc = ReadContext {
-			iovec: [ iovec_empty() ], // fill below
-			buf,
-			file,
-		};
-		// this "pins" buf, as the data is boxed
-		let mut reg = Registration::new(rc);
-		let queue_result = {
-			let iovec = unsafe {
-				let d = reg.data_mut();
-				d.iovec[0] = iovec_from(d.buf.as_mut());
-				&d.iovec
-			};
-
-			im.pinned().queue_async_read(fd, offset, iovec, reg.to_raw())
-		};
-		if let Err(e) = queue_result {
-			let data = reg.abort().expect("registration data");
-			return AsyncRead(AsyncReadState::InitFailed(e, data.buf, data.file));
-		}
-		AsyncRead(AsyncReadState::Pending(reg))
+	pub fn async_read<T, F>(&self, file: F, offset: u64, buf: T) -> AsyncRead<T, F>
+	where
+		T: AsMut<[u8]> + 'static,
+		F: AsRawFd + 'static,
+	{
+		AsyncRead::new(self, file, offset, buf)
 	}
 
-	pub fn async_write<T: AsRef<[u8]> + 'static, F: AsRawFd + 'static>(&self, file: F, offset: u64, buf: T) -> io::Result<AsyncWrite<T, F>> {
-		let fd = file.as_raw_fd();
-		let mut im = self.inner_mut()?;
-
-		let rc = WriteContext {
-			iovec: [ iovec_empty() ], // fill below
-			buf,
-			file,
-		};
-		// this "pins" buf, as the data is boxed
-		let mut reg = Registration::new(rc);
-		let iovec = unsafe {
-			let d = reg.data_mut();
-			d.iovec[0] = iovec_from(d.buf.as_ref());
-			&d.iovec
-		};
-
-		im.pinned().queue_async_write(fd, offset, iovec, reg.to_raw())?;
-		Ok(AsyncWrite(reg))
+	pub fn async_write<T: AsRef<[u8]> + 'static, F: AsRawFd + 'static>(&self, file: F, offset: u64, buf: T) -> AsyncWrite<T, F>
+	where
+		T: AsRef<[u8]> + 'static,
+		F: AsRawFd + 'static,
+	{
+		AsyncWrite::new(self, file, offset, buf)
 	}
 
 	pub fn async_poll(&self, fd: RawFd, flags: io_uring::PollFlags) -> AsyncPoll {
-		let registration = Registration::new(());
-
-		AsyncPoll {
-			active: false,
-			handle: self.clone(),
-			fd,
-			flags,
-			registration,
-		}
+		AsyncPoll::new(self, fd, flags)
 	}
 }
 

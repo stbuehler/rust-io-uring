@@ -38,9 +38,8 @@ pub fn main() {
 			.and_then(move |(n, mut buf, c)| {
 				buf.truncate(n);
 				println!("Echoing: {:?}", buf);
-				c.write(&whandle, buf)
+				c.write(&whandle, buf).map_err(|(e, _, _)| e)
 			})
-			.and_then(|w| w.map_err(|(e, _, _)| e))
 			.map(|(_,_,_)| println!("connection done"))
 			.map_err(|e| eprintln!("Connection error: {}", e))
 		);
