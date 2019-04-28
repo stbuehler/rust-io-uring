@@ -84,7 +84,7 @@ impl SubmissionEntry {
 	}
 
 	fn iov(&mut self, op: Operation, prio: IoPriority, fd: FileDescriptor, offset: u64, flags: ReadWriteFlags, iov: *const [libc::iovec]) {
-		self.opcode = op;
+		self.opcode = op.into();
 		self.flags = Default::default();
 		self.ioprio = prio.into();
 		match fd {
@@ -103,18 +103,18 @@ impl SubmissionEntry {
 		}
 	}
 
-	// technically the iov only needs to live until the entry was "taken" by the kernel; might be easier to keep it until completion though
+	// iov needs to live until operation is completed! (as the kernel might submit the request "async")
 	pub unsafe fn readv(&mut self, prio: IoPriority, fd: FileDescriptor, offset: u64, flags: ReadWriteFlags, iov: *const [libc::iovec]) {
-		self.iov(Operation::READV, prio, fd, offset, flags, iov);
+		self.iov(Operation::Readv, prio, fd, offset, flags, iov);
 	}
 
-	// technically the iov only needs to live until the entry was "taken" by the kernel; might be easier to keep it until completion though
+	// iov needs to live until operation is completed! (as the kernel might submit the request "async")
 	pub unsafe fn writev(&mut self, prio: IoPriority, fd: FileDescriptor, offset: u64, flags: ReadWriteFlags, iov: *const [libc::iovec]) {
-		self.iov(Operation::WRITEV, prio, fd, offset, flags, iov);
+		self.iov(Operation::Writev, prio, fd, offset, flags, iov);
 	}
 
 	fn io_fixed(&mut self, op: Operation, prio: IoPriority, fd: FileDescriptor, offset: u64, flags: ReadWriteFlags, buf_index: u16, buf: *const [u8]) {
-		self.opcode = op;
+		self.opcode = op.into();
 		self.flags = Default::default();
 		self.ioprio = prio.into();
 		match fd {
@@ -135,12 +135,12 @@ impl SubmissionEntry {
 
 	// buf must be a sub-slice of the buffer registered at the given index
 	pub unsafe fn read_fixed(&mut self, prio: IoPriority, fd: FileDescriptor, offset: u64, flags: ReadWriteFlags, buf_index: u16, buf: *const [u8]) {
-		self.io_fixed(Operation::READ_FIXED, prio, fd, offset, flags, buf_index, buf);
+		self.io_fixed(Operation::ReadFixed, prio, fd, offset, flags, buf_index, buf);
 	}
 
 	// buf must be a sub-slice of the buffer registered at the given index
 	pub unsafe fn write_fixed(&mut self, prio: IoPriority, fd: FileDescriptor, offset: u64, flags: ReadWriteFlags, buf_index: u16, buf: *const [u8]) {
-		self.io_fixed(Operation::WRITE_FIXED, prio, fd, offset, flags, buf_index, buf);
+		self.io_fixed(Operation::WriteFixed, prio, fd, offset, flags, buf_index, buf);
 	}
 
 	pub fn fsync_full(&mut self, fd: FileDescriptor, flags: FsyncFlags) {
@@ -150,7 +150,7 @@ impl SubmissionEntry {
 	// if offset + len == 0 it syncs until end of file
 	// right now it seems to require FsyncFlags::DATASYNC to be set.
 	pub fn fsync(&mut self, fd: FileDescriptor, flags: FsyncFlags, offset: u64, len: u32) {
-		self.opcode = Operation::FSYNC;
+		self.opcode = Operation::Fsync.into();
 		self.flags = Default::default();
 		self.ioprio = EncodedIoPriority(0);
 		match fd {
@@ -169,9 +169,9 @@ impl SubmissionEntry {
 		}
 	}
 
-	// requires SetupFlags::IOPOLL
+	// The CQE `res` will contain the mask with "ready" eventy flags
 	pub fn poll_add(&mut self, fd: FileDescriptor, flags: PollFlags) {
-		self.opcode = Operation::POLL_ADD;
+		self.opcode = Operation::PollAdd.into();
 		self.flags = Default::default();
 		self.ioprio = EncodedIoPriority(0);
 		match fd {
@@ -190,9 +190,9 @@ impl SubmissionEntry {
 		}
 	}
 
-	// remove pending POLL_ADD requests matching the given user_data
+	// the PollRemove operation will still complete (possibly with an empty mask)
 	pub fn poll_remove(&mut self, match_user_data: u64) {
-		self.opcode = Operation::POLL_REMOVE;
+		self.opcode = Operation::PollRemove.into();
 		self.flags = Default::default();
 		self.ioprio = EncodedIoPriority(0);
 		self.fd = 0;

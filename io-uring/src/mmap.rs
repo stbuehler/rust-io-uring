@@ -45,7 +45,7 @@ impl Drop for MappedMemory {
 	fn drop(&mut self) {
 		if self.len != 0 {
 			if 0 != unsafe { libc::munmap(self.addr, self.len) } {
-				eprintln!(
+				log::error!(
 					"munmap(0x{:x}, {}) failed: {}",
 					self.addr as usize,
 					self.len,

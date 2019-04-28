@@ -1,0 +1,14 @@
+[package]
+name = "tokio-uring-reactor"
+version = "0.1.0"
+authors = ["Stefan Bühler <stbuehler@web.de>"]
+edition = "2018"
+
+[dependencies]
+futures = "0.1.26"
+tokio-executor = "0.1.7"
+
+io-uring = { path = "../io-uring" }
+libc = "0.2.51"
+timerfd = "1.0.0"
+log = "0.4.6"

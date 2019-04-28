@@ -12,6 +12,7 @@ pub use submission::{
 use bitflags::bitflags;
 
 use core::mem::size_of;
+use core::fmt;
 use libc::{
 	c_int,
 	c_long,
@@ -264,8 +265,9 @@ pub struct CompletionQueueRingOffsets {
 
 /// C: `struct io_uring_sqe`
 #[repr(C)]
+#[derive(Debug)]
 pub struct SubmissionEntry {
-	pub opcode: Operation,
+	pub opcode: RawOperation,
 	pub flags: SubmissionEntryFlags,
 	pub ioprio: EncodedIoPriority,
 	pub fd: i32,
@@ -277,18 +279,58 @@ pub struct SubmissionEntry {
 	pub extra: SubmissionEntryExtraData,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+// #[non_exhaustive]
+pub enum Operation {
+	Nop = 0,
+	Readv = 1,
+	Writev = 2,
+	Fsync = 3,
+	ReadFixed = 4,
+	WriteFixed = 5,
+	PollAdd = 6,
+	PollRemove = 7,
+}
+
+impl Default for Operation {
+	fn default() -> Self {
+		Operation::Nop
+	}
+}
+
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
-pub struct Operation(pub u8);
-impl Operation {
-	pub const NOP         : Self = Self(0);
-	pub const READV       : Self = Self(1);
-	pub const WRITEV      : Self = Self(2);
-	pub const FSYNC       : Self = Self(3);
-	pub const READ_FIXED  : Self = Self(4);
-	pub const WRITE_FIXED : Self = Self(5);
-	pub const POLL_ADD    : Self = Self(6);
-	pub const POLL_REMOVE : Self = Self(7);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RawOperation(pub u8);
+impl RawOperation {
+	pub fn decode(self) -> Option<Operation> {
+		Some(match self.0 {
+			0 => Operation::Nop,
+			1 => Operation::Readv,
+			2 => Operation::Writev,
+			3 => Operation::Fsync,
+			4 => Operation::ReadFixed,
+			5 => Operation::WriteFixed,
+			6 => Operation::PollAdd,
+			7 => Operation::PollRemove,
+			_ => return None,
+		})
+	}
+}
+
+impl From<Operation> for RawOperation {
+	fn from(op: Operation) -> Self {
+		RawOperation(op as u8)
+	}
+}
+
+impl fmt::Debug for RawOperation {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		match self.decode() {
+			Some(op) => op.fmt(f),
+			None => f.debug_tuple("RawOperation").field(&self.0).finish(),
+		}
+	}
 }
 
 bitflags! {
@@ -316,6 +358,17 @@ pub union SubmissionEntryOperationFlags {
 	pub rw_flags: ReadWriteFlags,
 	pub fsync_flags: FsyncFlags,
 	pub poll_events: PollFlags,
+}
+
+impl fmt::Debug for SubmissionEntryOperationFlags {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		f.debug_struct("SubmissionEntryOperationFlags")
+			.field("raw", unsafe { &self.raw })
+			.field("rw_flags", unsafe { &self.rw_flags })
+			.field("fsync_flags", unsafe { &self.fsync_flags })
+			.field("poll_events", unsafe { &self.poll_events })
+			.finish()
+	}
 }
 
 impl From<u32> for SubmissionEntryOperationFlags {
@@ -445,6 +498,14 @@ bitflags! {
 pub union SubmissionEntryExtraData {
 	pub fixed: SubmissionEntryFixedOp,
 	_pad2: [u64; 3],
+}
+
+impl fmt::Debug for SubmissionEntryExtraData {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		f.debug_struct("SubmissionEntryExtraData")
+			.field("fixed", unsafe { &self.fixed })
+			.finish()
+	}
 }
 
 #[derive(Clone, Copy, Default, Debug)]

@@ -13,7 +13,7 @@ use std::os::unix::io::{
 };
 use std::mem::size_of;
 
-use io_uring_sys::*;
+pub use io_uring_sys::*;
 use crate::mmap::MappedMemory;
 
 pub struct Uring {
@@ -25,8 +25,8 @@ pub struct Uring {
 impl Uring {
 	pub fn new(entries: u32, mut params: SetupParameters) -> io::Result<Self> {
 		let file = UringFile::new(entries, &mut params)?;
-		let sq = SubmissionQueue::new(&file, &params)?;
-		let cq = CompletionQueue::new(&file, &params)?;
+		let sq = SubmissionQueue::new(&file, &params.sq_off, params.sq_entries)?;
+		let cq = CompletionQueue::new(&file, &params.cq_off, params.cq_entries)?;
 
 		Ok(Uring {
 			file,
@@ -35,7 +35,7 @@ impl Uring {
 		})
 	}
 
-	pub fn file(&mut self) -> &UringFile {
+	pub fn file(&mut self) -> &mut UringFile {
 		&mut self.file
 	}
 
@@ -61,7 +61,7 @@ pub struct SubmissionQueue {
 	// `tail` is controlled by us; we can stage multiple entries and
 	// then flush them in one update
 	k_tail: &'static AtomicU32,
-	cached_tail: u32,
+	local_tail: u32,
 
 	// `ring_mask` and `ring_entries` are const, so only read them once.
 	ring_mask: u32,
@@ -84,31 +84,31 @@ pub struct SubmissionQueue {
 }
 
 impl SubmissionQueue {
-	fn new(file: &UringFile, params: &SetupParameters) -> io::Result<Self> {
+	fn new(file: &UringFile, offsets: &SubmissionQueueRingOffsets, sq_entries: u32) -> io::Result<Self> {
 		let mmap = MappedMemory::map(
 			file.as_raw_fd(),
 			SetupParameters::SUBMISSION_QUEUE_RING_OFFSET,
-			(params.sq_off.array as usize) + size_of::<u32>() * (params.sq_entries as usize),
+			(offsets.array as usize) + size_of::<u32>() * (sq_entries as usize),
 		)?;
 		let mmap_entries = MappedMemory::map(
 			file.as_raw_fd(),
 			SetupParameters::SUBMISSION_QUEUE_ENTRIES_OFFSET,
-			size_of::<SubmissionEntry>() * (params.sq_entries as usize),
+			size_of::<SubmissionEntry>() * (sq_entries as usize),
 		)?;
-		let k_head: &AtomicU32 = unsafe { &*mmap.get_field(params.sq_off.head) };
+		let k_head: &AtomicU32 = unsafe { &*mmap.get_field(offsets.head) };
 		let cached_head = k_head.load(Ordering::Relaxed);
-		let k_tail: &AtomicU32 = unsafe { &*mmap.get_field(params.sq_off.tail) };
-		let cached_tail = k_tail.load(Ordering::Relaxed);
-		let k_ring_mask: *mut u32 = mmap.get_field(params.sq_off.ring_mask);
+		let k_tail: &AtomicU32 = unsafe { &*mmap.get_field(offsets.tail) };
+		let local_tail = k_tail.load(Ordering::Relaxed);
+		let k_ring_mask: *mut u32 = mmap.get_field(offsets.ring_mask);
 		let ring_mask = unsafe { *k_ring_mask };
-		let k_ring_entries: *mut u32 = mmap.get_field(params.sq_off.ring_entries);
+		let k_ring_entries: *mut u32 = mmap.get_field(offsets.ring_entries);
 		let ring_entries = unsafe { *k_ring_entries };
-		let k_flags: &AtomicU32 = unsafe { &*mmap.get_field(params.sq_off.flags) };
-		let k_dropped: &AtomicU32 = unsafe { &*mmap.get_field(params.sq_off.dropped) };
-		let k_array: *mut u32 = mmap.get_field(params.sq_off.array);
-		let sces: *mut SubmissionEntry = mmap.as_mut_ptr() as *mut SubmissionEntry;
+		let k_flags: &AtomicU32 = unsafe { &*mmap.get_field(offsets.flags) };
+		let k_dropped: &AtomicU32 = unsafe { &*mmap.get_field(offsets.dropped) };
+		let k_array: *mut u32 = mmap.get_field(offsets.array);
+		let sces: *mut SubmissionEntry = mmap_entries.as_mut_ptr() as *mut SubmissionEntry;
 
-		assert_eq!(params.sq_entries, ring_entries);
+		assert_eq!(sq_entries, ring_entries);
 		assert!(ring_entries.is_power_of_two());
 		assert_eq!(ring_mask, ring_entries - 1);
 
@@ -122,7 +122,7 @@ impl SubmissionQueue {
 			k_head,
 			cached_head,
 			k_tail,
-			cached_tail,
+			local_tail,
 			ring_mask,
 			// ring_entries,
 			k_flags,
@@ -133,13 +133,14 @@ impl SubmissionQueue {
 	}
 
 	fn flush_tail(&mut self) {
-		self.k_tail.store(self.cached_tail, Ordering::Release);
+		log::trace!("SQ updating tail: {}", self.local_tail);
+		self.k_tail.store(self.local_tail, Ordering::Release);
 	}
 
 	fn head(&mut self) -> u32 {
-		if self.cached_head != self.cached_tail {
+		if self.cached_head != self.local_tail {
 			// ring not empty
-			if 0 == ((self.cached_head ^ self.cached_tail) & self.ring_mask) {
+			if 0 == ((self.cached_head ^ self.local_tail) & self.ring_mask) {
 				// head and tail point to same entry, potentially full; refresh cache
 				self.refresh_head();
 			}
@@ -149,13 +150,14 @@ impl SubmissionQueue {
 
 	fn refresh_head(&mut self) -> u32 {
 		self.cached_head = self.k_head.load(Ordering::Acquire);
+		log::trace!("Refreshed SQ head: {}", self.cached_head);
 		self.cached_head
 	}
 
 	pub fn is_full(&mut self) -> bool {
 		let head = self.head();
-		(head != self.cached_tail) // not empty
-		&& 0 == ((self.cached_head ^ self.cached_tail) & self.ring_mask) // point to same entry
+		(head != self.local_tail) // not empty
+		&& 0 == ((self.cached_head ^ self.local_tail) & self.ring_mask) // point to same entry
 	}
 
 	pub fn bulk(&mut self) -> BulkSubmission {
@@ -170,8 +172,12 @@ impl SubmissionQueue {
 		self.k_dropped.load(Ordering::Relaxed)
 	}
 
-	pub fn pending_submissions(&mut self) -> bool {
-		self.refresh_head() != self.cached_tail
+	pub fn has_pending_submissions(&mut self) -> bool {
+		self.refresh_head() != self.local_tail
+	}
+
+	pub fn pending_submissions(&mut self) -> u32 {
+		self.local_tail - self.refresh_head()
 	}
 }
 
@@ -211,11 +217,12 @@ impl BulkSubmission<'_> {
 		F: FnOnce(&mut SubmissionEntry) -> Result<(), E>
 	{
 		if self.is_full() { return Err(SubmissionError::QueueFull); }
-		let ndx = self.0.cached_tail;
+		let ndx = self.0.local_tail;
 		let entry = unsafe { &mut *self.0.sces.add((ndx & self.0.ring_mask) as usize) };
 		entry.clear();
 		f(entry).map_err(SubmissionError::FillError)?;
-		self.0.cached_tail = ndx.wrapping_add(1);
+		log::debug!("Submit: @{} -> {:?}", ndx, entry);
+		self.0.local_tail = ndx.wrapping_add(1);
 		Ok(())
 	}
 }
@@ -230,9 +237,9 @@ pub struct CompletionQueue {
 	_mmap: MappedMemory,
 
 	// updated by userspace; increment after entry at head was read; for
-	// bulk reading only increment cached_head and write back alter
+	// bulk reading only increment local_head and write back alter
 	k_head: &'static AtomicU32,
-	cached_head: u32,
+	local_head: u32,
 
 	// updated by kernel; update cached value once (cached) head reaches
 	// cached tail.
@@ -250,31 +257,31 @@ pub struct CompletionQueue {
 }
 
 impl CompletionQueue {
-	fn new(file: &UringFile, params: &SetupParameters) -> io::Result<Self> {
+	fn new(file: &UringFile, offsets: &CompletionQueueRingOffsets, cq_entries: u32) -> io::Result<Self> {
 		let mmap = MappedMemory::map(
 			file.as_raw_fd(),
 			SetupParameters::COMPLETION_QUEUE_RING_OFFSET,
-			(params.cq_off.cqes as usize) + size_of::<CompletionEntry>() * (params.cq_entries as usize),
+			(offsets.cqes as usize) + size_of::<CompletionEntry>() * (cq_entries as usize),
 		)?;
-		let k_head: &AtomicU32 = unsafe { &*mmap.get_field(params.cq_off.head) };
-		let cached_head = k_head.load(Ordering::Relaxed);
-		let k_tail: &AtomicU32 = unsafe { &*mmap.get_field(params.cq_off.tail) };
+		let k_head: &AtomicU32 = unsafe { &*mmap.get_field(offsets.head) };
+		let local_head = k_head.load(Ordering::Relaxed);
+		let k_tail: &AtomicU32 = unsafe { &*mmap.get_field(offsets.tail) };
 		let cached_tail = k_tail.load(Ordering::Relaxed);
-		let k_ring_mask: *mut u32 = mmap.get_field(params.cq_off.ring_mask);
+		let k_ring_mask: *mut u32 = mmap.get_field(offsets.ring_mask);
 		let ring_mask = unsafe { *k_ring_mask };
-		let k_ring_entries: *mut u32 = mmap.get_field(params.cq_off.ring_entries);
+		let k_ring_entries: *mut u32 = mmap.get_field(offsets.ring_entries);
 		let ring_entries = unsafe { *k_ring_entries };
-		let k_overflow: &AtomicU32 = unsafe { &*mmap.get_field(params.cq_off.overflow) };
-		let k_cqes: *mut CompletionEntry = mmap.get_field(params.cq_off.cqes);
+		let k_overflow: &AtomicU32 = unsafe { &*mmap.get_field(offsets.overflow) };
+		let k_cqes: *mut CompletionEntry = mmap.get_field(offsets.cqes);
 
-		assert_eq!(params.cq_entries, ring_entries);
+		assert_eq!(cq_entries, ring_entries);
 		assert!(ring_entries.is_power_of_two());
 		assert_eq!(ring_mask, ring_entries - 1);
 
 		Ok(CompletionQueue {
 			_mmap: mmap,
 			k_head,
-			cached_head,
+			local_head,
 			k_tail,
 			cached_tail,
 			ring_mask,
@@ -285,7 +292,7 @@ impl CompletionQueue {
 	}
 
 	fn flush_head(&mut self) {
-		self.k_head.store(self.cached_head, Ordering::Release);
+		self.k_head.store(self.local_head, Ordering::Release);
 	}
 
 	fn refresh_tail(&mut self) -> u32 {
@@ -294,9 +301,9 @@ impl CompletionQueue {
 	}
 
 	fn is_empty(&mut self) -> bool {
-		if self.cached_tail == self.cached_head {
+		if self.cached_tail == self.local_head {
 			self.refresh_tail();
-			self.cached_tail == self.cached_head
+			self.cached_tail == self.local_head
 		} else {
 			false
 		}
@@ -323,9 +330,10 @@ impl Iterator for BulkCompletion<'_> {
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if self.0.is_empty() { return None; }
-		let ndx = self.0.cached_head;
+		let ndx = self.0.local_head;
 		let item = unsafe { &*self.0.k_cqes.add((ndx & self.0.ring_mask) as usize) }.clone();
-		self.0.cached_head = ndx.wrapping_add(1);
+		self.0.local_head = ndx.wrapping_add(1);
+		log::debug!("Completed: @{} -> {:?}", ndx, item);
 		Some(item)
 	}
 }
@@ -354,7 +362,7 @@ impl UringFile {
 			Some(sig) => sig as *const _,
 			None => 0 as *const _,
 		};
-		if unsafe { io_uring_enter(self.as_raw_fd(), to_submit, min_complete, flags.bits(), sig) } != 0 {
+		if unsafe { io_uring_enter(self.as_raw_fd(), to_submit, min_complete, flags.bits(), sig) } < 0 {
 			Err(io::Error::last_os_error())
 		} else {
 			Ok(())
@@ -418,4 +426,3 @@ impl FromRawFd for UringFile {
 		UringFile(std::fs::File::from_raw_fd(fd))
 	}
 }
-

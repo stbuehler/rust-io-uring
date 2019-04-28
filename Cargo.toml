@@ -1,9 +1,7 @@
-[package]
-name = "rust-io-uring"
-version = "0.1.0"
-authors = ["Stefan Bühler <stbuehler@web.de>"]
-edition = "2018"
-
-[dependencies]
-io-uring-sys = { path = "io-uring-sys" }
-libc = "0.2.51"
+[workspace]
+members = [
+	"io-uring-sys",
+	"io-uring",
+	"tokio-uring-reactor",
+	"tokio-uring",
+]
