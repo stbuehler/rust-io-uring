@@ -25,12 +25,11 @@ pub fn main() {
 		let whandle = handle.clone();
 		buf.resize_with(512, Default::default);
 		tokio_current_thread::spawn(
-			Timeout::new(c.read(&handle, buf), Duration::from_secs(3))
+			Timeout::new(c.read(&handle, buf).from_err(), Duration::from_secs(3))
 			.map_err(|e| {
 				eprintln!("timout/read error");
 				if e.is_inner() {
-					let (e, _, _) = e.into_inner().expect("inner");
-					e
+					e.into_inner().expect("inner")
 				} else {
 					io::Error::new(io::ErrorKind::TimedOut, "timeout")
 				}
@@ -38,7 +37,7 @@ pub fn main() {
 			.and_then(move |(n, mut buf, c)| {
 				buf.truncate(n);
 				println!("Echoing: {:?}", buf);
-				c.write(&whandle, buf).map_err(|(e, _, _)| e)
+				c.write(&whandle, buf).from_err()
 			})
 			.map(|(_,_,_)| println!("connection done"))
 			.map_err(|e| eprintln!("Connection error: {}", e))

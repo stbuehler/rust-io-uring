@@ -15,87 +15,121 @@ use crate::{
 	},
 };
 
-struct ReadContext<T: 'static, F: 'static> {
+// #[non_exhaustive] TODO ?
+pub struct AsyncReadError<T, F> {
+	pub error: io::Error,
+	pub buffer: T,
+	pub file: F,
+}
+
+impl<T, F> From<AsyncReadError<T, F>> for io::Error {
+	fn from(e: AsyncReadError<T, F>) -> io::Error {
+		e.error
+	}
+}
+
+struct Context<T: 'static, F: 'static> {
 	iovec: [libc::iovec; 1],
-	buf: T,
+	buffer: T,
 	file: F,
 }
 
-enum AsyncReadState<T: 'static, F: 'static> {
-	Pending(Registration<ReadContext<T, F>>),
-	InitFailed(io::Error, T, F),
+impl<T: 'static, F: 'static> Context<T, F> {
+	fn with_error(self, error: io::Error) -> AsyncReadError<T, F> {
+		AsyncReadError {
+			error,
+			buffer: self.buffer,
+			file: self.file,
+		}
+	}
+}
+
+enum State<T: 'static, F: 'static> {
+	Pending(Registration<Context<T, F>>),
+	InitFailed(AsyncReadError<T, F>),
 	Closed,
 }
 
-pub struct AsyncRead<T: 'static, F: 'static>(AsyncReadState<T, F>);
+impl<T: 'static, F: 'static> fmt::Debug for State<T, F> {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		match self {
+			State::Pending(ref p) => f.debug_tuple("Pending").field(p).finish(),
+			State::InitFailed(ref e) => f.debug_tuple("InitFailed").field(&e.error).finish(),
+			State::Closed => f.debug_tuple("Closed").finish(),
+		}
+	}
+}
+
+pub struct AsyncRead<T: 'static, F: 'static>(State<T, F>);
 
 impl<T, F> AsyncRead<T, F> {
-	pub(super) fn new(handle: &Handle, file: F, offset: u64, buf: T) -> AsyncRead<T, F>
+	pub(super) fn new(handle: &Handle, file: F, offset: u64, buffer: T) -> AsyncRead<T, F>
 	where
 		T: AsMut<[u8]> + 'static,
 		F: AsRawFd + 'static,
 	{
 		let fd = file.as_raw_fd();
+		let context = Context {
+			iovec: [ iovec_empty() ], // fill below
+			buffer,
+			file,
+		};
+
 		let mut im = match handle.inner_mut() {
-			Err(e) => return AsyncRead(AsyncReadState::InitFailed(e, buf, file)),
+			Err(e) => return AsyncRead(State::InitFailed(context.with_error(e))),
 			Ok(im) => im,
 		};
 
-		let rc = ReadContext {
-			iovec: [ iovec_empty() ], // fill below
-			buf,
-			file,
-		};
 		// this "pins" buf, as the data is boxed
-		let mut reg = Registration::new(rc);
+		let mut reg = Registration::new(context);
 		let queue_result = {
 			let iovec = unsafe {
 				let d = reg.data_mut();
-				d.iovec[0] = iovec_from(d.buf.as_mut());
+				d.iovec[0] = iovec_from(d.buffer.as_mut());
 				&d.iovec
 			};
 
 			im.pinned().queue_async_read(fd, offset, iovec, reg.to_raw())
 		};
 		if let Err(e) = queue_result {
-			let data = reg.abort().expect("registration data");
-			return AsyncRead(AsyncReadState::InitFailed(e, data.buf, data.file));
+			let context = reg.abort().expect("registration context");
+			return AsyncRead(State::InitFailed(context.with_error(e)));
 		}
-		AsyncRead(AsyncReadState::Pending(reg))
+		AsyncRead(State::Pending(reg))
 	}
 }
 
 impl<T: 'static, F: 'static> fmt::Debug for AsyncRead<T, F> {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "AsyncRead(..)")
+		f.debug_tuple("AsyncRead").field(&self.0).finish()
 	}
 }
 
 impl<T: 'static, F: 'static> futures::Future for AsyncRead<T, F> {
 	type Item = (usize, T, F);
-	type Error = (io::Error, T, F);
+	type Error = AsyncReadError<T, F>;
 
 	fn poll(&mut self) -> futures::Poll<Self::Item, Self::Error> {
 		match self.0 {
-			AsyncReadState::Pending(ref mut p) => {
+			State::Pending(ref mut p) => {
 				match p.poll() {
 					futures::Async::NotReady => Ok(futures::Async::NotReady),
-					futures::Async::Ready((r, d)) => {
+					futures::Async::Ready((r, context)) => {
 						let result = if r.result < 0 {
-							Err((io::Error::from_raw_os_error(r.result), d.buf, d.file))
+							Err(context.with_error(io::Error::from_raw_os_error(-r.result)))
 						} else {
-							Ok(futures::Async::Ready((r.result as usize, d.buf, d.file)))
+							Ok(futures::Async::Ready((r.result as usize, context.buffer, context.file)))
 						};
-						std::mem::replace(&mut self.0, AsyncReadState::Closed);
+						std::mem::replace(&mut self.0, State::Closed);
 						result
 					}
 				}
 			},
 			_ => {
-				match std::mem::replace(&mut self.0, AsyncReadState::Closed) {
-					AsyncReadState::Pending(_) => unreachable!(),
-					AsyncReadState::InitFailed(e, buf, file) => Err((e, buf, file)),
-					AsyncReadState::Closed => panic!("already finished"),
+				match std::mem::replace(&mut self.0, State::Closed) {
+					State::Pending(_) => unreachable!(),
+					State::InitFailed(e) => Err(e),
+					State::Closed => panic!("already finished"),
 				}
 			}
 		}

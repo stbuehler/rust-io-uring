@@ -54,7 +54,7 @@ impl futures::Stream for AsyncPoll {
 			futures::Async::Ready(r) => {
 				self.active = false;
 				if r.result < 0 {
-					return Err(io::Error::from_raw_os_error(r.result));
+					return Err(io::Error::from_raw_os_error(-r.result));
 				}
 				let flags = io_uring::PollFlags::from_bits_truncate(r.result as u16);
 				Ok(futures::Async::Ready(Some(flags)))
