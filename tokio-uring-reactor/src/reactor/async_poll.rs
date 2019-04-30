@@ -62,3 +62,38 @@ impl futures::Stream for AsyncPoll {
 		}
 	}
 }
+
+#[cfg(feature = "nightly-async")]
+use std::{
+	pin::Pin,
+	future::Future,
+	task::Poll,
+	task::Context,
+};
+
+#[cfg(feature = "nightly-async")]
+impl Future for AsyncPoll {
+	type Output = io::Result<io_uring::PollFlags>;
+
+	fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+		if !self.active {
+			// println!("Register fd {} for events {:?}", self.fd, self.flags);
+			let mut im = self.handle.inner_mut()?;
+			im.pinned().queue_async_poll(self.fd, self.flags, self.registration.to_raw())?;
+			self.active = true;
+			self.registration.track_async(ctx.waker());
+			return Poll::Pending;
+		}
+		match self.registration.poll_stream_and_reset_async(ctx.waker()) {
+			Poll::Pending => Poll::Pending,
+			Poll::Ready(r) => {
+				self.active = false;
+				if r.result < 0 {
+					return Poll::Ready(Err(io::Error::from_raw_os_error(-r.result)));
+				}
+				let flags = io_uring::PollFlags::from_bits_truncate(r.result as u16);
+				Poll::Ready(Ok(flags))
+			}
+		}
+	}
+}

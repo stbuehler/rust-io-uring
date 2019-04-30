@@ -1,0 +1,17 @@
+[package]
+name = "echo-async"
+version = "0.1.0"
+authors = ["Stefan Bühler <stbuehler@web.de>"]
+edition = "2018"
+
+[dependencies]
+futures = "0.1.26"
+tokio-current-thread = "0.1.6"
+tokio-timer = "0.2.8"
+tokio-executor = "0.1.7"
+tokio-uring-reactor = { path = "../tokio-uring-reactor", features = ["nightly-async"] }
+tokio-uring = { path = "../tokio-uring" }
+env_logger = "0.6.1"
+
+futures-core-preview = { version = "=0.3.0-alpha.15" }
+futures-util-preview = { version = "=0.3.0-alpha.15", features = ["compat"] }

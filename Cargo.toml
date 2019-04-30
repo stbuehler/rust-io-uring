@@ -4,4 +4,5 @@ members = [
 	"io-uring",
 	"tokio-uring-reactor",
 	"tokio-uring",
+	"echo-async",
 ]

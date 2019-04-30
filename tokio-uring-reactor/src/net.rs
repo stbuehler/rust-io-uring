@@ -2,6 +2,16 @@ use std::net;
 use std::io;
 use std::os::unix::io::{RawFd, AsRawFd};
 
+#[cfg(feature = "nightly-async")]
+use std::{
+	pin::Pin,
+	future::Future,
+	task::Poll,
+	task::Context,
+};
+#[cfg(feature = "nightly-async")]
+use futures_core;
+
 use crate::Handle;
 
 #[derive(Debug)]
@@ -60,6 +70,41 @@ impl futures::Stream for Incoming {
 				futures::Async::NotReady => return Ok(futures::Async::NotReady),
 				futures::Async::Ready(None) => unreachable!(),
 				futures::Async::Ready(Some(_events)) => {
+					// println!("Incoming events: {:?}", _events);
+					self.blocked = false;
+					// try loop again
+				},
+			}
+		}
+	}
+}
+
+#[cfg(feature = "nightly-async")]
+impl futures_core::Stream for Incoming {
+	type Item = io::Result<(TcpStream, net::SocketAddr)>;
+
+	fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		loop {
+			if !self.blocked {
+				match self.inner.0.accept() {
+					Ok((s, a)) => return Poll::Ready(Some(Ok((
+						TcpStream(s),
+						a,
+					)))),
+					Err(e) => {
+						if e.kind() == io::ErrorKind::Interrupted {
+							continue; // again
+						} else if e.kind() == io::ErrorKind::WouldBlock {
+							self.blocked = true;
+						} else {
+							return Poll::Ready(Some(Err(e)));
+						}
+					}
+				}
+			}
+			match unsafe { Pin::new_unchecked(&mut self.poll) }.poll(ctx)? {
+				Poll::Pending => return Poll::Pending,
+				Poll::Ready(_events) => {
 					// println!("Incoming events: {:?}", _events);
 					self.blocked = false;
 					// try loop again

@@ -4,6 +4,45 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+#[cfg(feature = "nightly-async")]
+use std::{
+	task::Waker,
+	task::Poll,
+};
+
+enum CompatWaker {
+	Empty,
+	Old(futures::task::Task),
+	#[cfg(feature = "nightly-async")]
+	New(Waker),
+}
+
+impl CompatWaker {
+	fn notify(&mut self) {
+		match std::mem::replace(self, CompatWaker::Empty) {
+			CompatWaker::Empty => (),
+			CompatWaker::Old(t) => t.notify(),
+			#[cfg(feature = "nightly-async")]
+			CompatWaker::New(w) => w.wake(),
+		}
+	}
+
+	fn register_old(&mut self) {
+		*self = CompatWaker::Old(futures::task::current());
+	}
+
+	#[cfg(feature = "nightly-async")]
+	fn register_new(&mut self, waker: &Waker) {
+		*self = CompatWaker::New(waker.clone());
+	}
+}
+
+impl Default for CompatWaker {
+	fn default() -> Self {
+		CompatWaker::Empty
+	}
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct UringResult {
 	pub result: i32,
@@ -14,7 +53,7 @@ pub struct UringResult {
 struct Inner {
 	result: UringResult,
 	finished: bool,
-	waker: futures::task::AtomicTask,
+	waker: UnsafeCell<CompatWaker>,
 	data: Option<Box<dyn Any>>,
 }
 
@@ -28,7 +67,8 @@ impl RawRegistration {
 		assert!(!inner.finished);
 		inner.finished = true;
 		inner.result = result;
-		inner.waker.notify();
+		let waker = unsafe { &mut *inner.waker.get() };
+		waker.notify();
 	}
 
 	pub unsafe fn into_user_data(self) -> u64 {
@@ -63,7 +103,15 @@ impl<T: 'static> Registration<T> {
 
 	pub fn track(&mut self) {
 		let inner = unsafe { &mut *self.inner.get() };
-		inner.waker.register();
+		let waker = unsafe { &mut *inner.waker.get() };
+		waker.register_old();
+	}
+
+	#[cfg(feature = "nightly-async")]
+	pub fn track_async(&mut self, waker: &Waker) {
+		let inner = unsafe { &mut *self.inner.get() };
+		let w = unsafe { &mut *inner.waker.get() };
+		w.register_new(waker);
 	}
 
 	pub fn poll(&mut self) -> futures::Async<(UringResult, T)> {
@@ -77,8 +125,27 @@ impl<T: 'static> Registration<T> {
 			let data = inner.data.take().expect("data").downcast::<T>().expect("type");
 			futures::Async::Ready((result, *data))
 		} else {
-			inner.waker.register();
+			let waker = unsafe { &mut *inner.waker.get() };
+			waker.register_old();
 			futures::Async::NotReady
+		}
+	}
+
+	#[cfg(feature = "nightly-async")]
+	pub fn poll_async(&mut self, waker: &Waker) -> Poll<(UringResult, T)> {
+		let inner = unsafe { &mut *self.inner.get() };
+		if inner.data.is_none() {
+			// or panic? can't become ready again
+			return Poll::Pending;
+		}
+		if inner.finished {
+			let result = inner.result;
+			let data = inner.data.take().expect("data").downcast::<T>().expect("type");
+			Poll::Ready((result, *data))
+		} else {
+			let w = unsafe { &mut *inner.waker.get() };
+			w.register_new(waker);
+			Poll::Pending
 		}
 	}
 
@@ -115,8 +182,22 @@ impl Registration<()> {
 			inner.finished = false; // reset
 			futures::Async::Ready(inner.result)
 		} else {
-			inner.waker.register();
+			let waker = unsafe { &mut *inner.waker.get() };
+			waker.register_old();
 			futures::Async::NotReady
+		}
+	}
+
+	#[cfg(feature = "nightly-async")]
+	pub fn poll_stream_and_reset_async(&mut self, waker: &Waker) -> Poll<UringResult> {
+		let inner = unsafe { &mut *self.inner.get() };
+		if inner.finished {
+			inner.finished = false; // reset
+			Poll::Ready(inner.result)
+		} else {
+			let w = unsafe { &mut *inner.waker.get() };
+			w.register_new(waker);
+			Poll::Pending
 		}
 	}
 }

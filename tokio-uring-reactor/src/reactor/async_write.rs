@@ -135,3 +135,43 @@ impl<T: 'static, F: 'static> futures::Future for AsyncWrite<T, F> {
 		}
 	}
 }
+
+#[cfg(feature = "nightly-async")]
+use std::{
+	pin::Pin,
+	task,
+	future::Future,
+	task::Poll,
+};
+
+#[cfg(feature = "nightly-async")]
+impl<T: Unpin + 'static, F: Unpin + 'static> Future for AsyncWrite<T, F> {
+	type Output = Result<(usize, T, F), AsyncWriteError<T, F>>;
+
+	fn poll(mut self: Pin<&mut Self>, ctx: &mut task::Context) -> Poll<Self::Output> {
+		let this: &mut Self = &mut *self;
+		match this.0 {
+			State::Pending(ref mut p) => {
+				match p.poll_async(ctx.waker()) {
+					Poll::Pending => Poll::Pending,
+					Poll::Ready((r, context)) => {
+						let result = if r.result < 0 {
+							Err(context.with_error(io::Error::from_raw_os_error(-r.result)))
+						} else {
+							Ok((r.result as usize, context.buffer, context.file))
+						};
+						std::mem::replace(&mut this.0, State::Closed);
+						Poll::Ready(result)
+					}
+				}
+			},
+			_ => {
+				match std::mem::replace(&mut this.0, State::Closed) {
+					State::Pending(_) => unreachable!(),
+					State::InitFailed(e) => Poll::Ready(Err(e)),
+					State::Closed => panic!("already finished"),
+				}
+			}
+		}
+	}
+}
